@@ -1,0 +1,12 @@
+[package]
+name = "tored"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arti-client = { version = "0.22.0", features = ["onion-service-client", "static-sqlite"] }
+http = "1.1.0"
+tokio = { version = "1.40.0", default-features = false, features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
+tor-rtcompat = "0.22.0"
