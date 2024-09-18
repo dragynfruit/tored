@@ -1,7 +1,7 @@
 use arti_client::{config::BoolOrAuto, DataStream, StreamPrefs, TorClient, TorClientConfig};
 use cookie::CookieJar;
 use http::{HeaderMap, HeaderName, HeaderValue};
-use std::env;
+use std::{env, error::Error};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -155,7 +155,7 @@ async fn handler(
     state: AppState,
     stream: &mut TcpStream,
     public_host: &String,
-) -> Result<(), tokio::io::Error> {
+) -> Result<(), Box<dyn Error>> {
     let mut kept_tor_stream: Option<DataStream> = None;
 
     loop {
@@ -167,8 +167,7 @@ async fn handler(
             || request_headers
                 .get("Host")
                 .unwrap()
-                .to_str()
-                .unwrap()
+                .to_str()?
                 .starts_with(public_host)
         {
             let response = format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello");
@@ -181,14 +180,13 @@ async fn handler(
         let onion_host = request_headers
             .get("Host")
             .unwrap()
-            .to_str()
-            .unwrap()
+            .to_str()?
             .split_once(format!(".{public_host}").as_str())
             .unwrap()
             .0
             .to_string()
             + &".onion".to_string();
-        request_headers.insert("Host", HeaderValue::from_str(&onion_host).unwrap());
+        request_headers.insert("Host", HeaderValue::from_str(&onion_host)?);
         request_headers.remove("Referer");
 
         // re-create header
@@ -196,14 +194,21 @@ async fn handler(
 
         // get tor stream if it is not created
         if kept_tor_stream.is_none() {
-            kept_tor_stream = Some(state
+            let tor_stream = state
                 .tor_client
                 .connect_with_prefs(
                     (onion_host.clone(), 80),
                     StreamPrefs::new().connect_to_onion_services(BoolOrAuto::Explicit(true)),
                 )
-                .await
-                .unwrap());
+                .await;
+
+            if tor_stream.is_err() {
+                stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+                    .await?;
+                return Ok(());
+            }
+
+            kept_tor_stream = Some(tor_stream.unwrap());
         }
         let mut tor_stream = kept_tor_stream.as_mut().unwrap();
 
@@ -219,20 +224,20 @@ async fn handler(
         tor_stream.flush().await?;
 
         // read response
-        let (status_line, mut response_headers, mut cookies) = read_header_data(&mut tor_stream).await?;
+        let (status_line, mut response_headers, mut cookies) =
+            read_header_data(&mut tor_stream).await?;
 
         // read response code from status line
         let status_code = status_line
             .split_whitespace()
             .nth(1)
             .unwrap()
-            .parse::<u16>()
-            .unwrap();
+            .parse::<u16>()?;
 
         // if it is a redirect, change location to host. If it is not a .onion return warning to user
         if status_code / 100 == 3 {
             if let Some(location) = response_headers.get("Location") {
-                let location = location.to_str().unwrap();
+                let location = location.to_str()?;
                 let is_onion = location
                     .replace("http://", "")
                     .replace("https://", "")
@@ -243,7 +248,8 @@ async fn handler(
 
                 if is_onion {
                     let new_location = location.replace(".onion", &format!(".{}", public_host));
-                    response_headers.insert("Location", HeaderValue::from_str(&new_location).unwrap());
+                    response_headers
+                        .insert("Location", HeaderValue::from_str(&new_location).unwrap());
                 } else {
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
