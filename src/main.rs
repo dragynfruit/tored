@@ -160,7 +160,16 @@ async fn handler(
 
     loop {
         // read request
-        let (request_line, mut request_headers, _) = read_header_data(stream).await?;
+        let (request_line, mut request_headers, _) = match read_header_data(stream).await {
+            Ok(data) => data,
+            Err(err) => {
+                if err.kind() == tokio::io::ErrorKind::UnexpectedEof {
+                    log::debug!("Client closed connection");
+                }
+                return Err(Box::new(err));
+            }
+        };
+        log::trace!("Read request: {}", request_line);
 
         // Send blank page
         if request_headers.get("Host").is_none()
@@ -170,10 +179,9 @@ async fn handler(
                 .to_str()?
                 .starts_with(public_host)
         {
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello");
-            stream.write_all(response.as_bytes()).await?;
+            log::debug!("Sending blank page");
+            stream.write_all("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello".as_bytes()).await?;
             stream.flush().await?;
-            return Ok(());
         }
 
         // change host to onion
@@ -188,12 +196,15 @@ async fn handler(
             + &".onion".to_string();
         request_headers.insert("Host", HeaderValue::from_str(&onion_host)?);
         request_headers.remove("Referer");
+        log::trace!("Changed host to: {}", onion_host);
 
         // re-create header
         let header_bytes = headers_to_bytes(&mut request_headers.clone());
+        log::trace!("Recreated headers");
 
         // get tor stream if it is not created
         if kept_tor_stream.is_none() {
+            log::trace!("Creating tor stream");
             let tor_stream = state
                 .tor_client
                 .connect_with_prefs(
@@ -203,14 +214,19 @@ async fn handler(
                 .await;
 
             if tor_stream.is_err() {
-                stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
+                log::warn!("Failed to create tor stream");
+                stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 11\r\n\r\nBad Gateway")
                     .await?;
-                return Ok(());
+                stream.flush().await?;
+                break;
             }
 
+            log::trace!("Tor stream created");
             kept_tor_stream = Some(tor_stream.unwrap());
         }
         let mut tor_stream = kept_tor_stream.as_mut().unwrap();
+        log::trace!("Got tor stream");
 
         // send request headers
         tor_stream.write_all(&request_line.as_bytes()).await?;
@@ -218,14 +234,17 @@ async fn handler(
         tor_stream.write_all(&header_bytes).await?;
         tor_stream.write_all(b"\r\n").await?;
         tor_stream.flush().await?;
+        log::trace!("Sent request headers");
 
         // send body
         forward_body(stream, &mut tor_stream, &request_headers).await?;
         tor_stream.flush().await?;
+        log::trace!("Sent body");
 
         // read response
         let (status_line, mut response_headers, mut cookies) =
             read_header_data(&mut tor_stream).await?;
+        log::trace!("Read response: {}", status_line);
 
         // read response code from status line
         let status_code = status_line
@@ -233,9 +252,11 @@ async fn handler(
             .nth(1)
             .unwrap()
             .parse::<u16>()?;
+        log::trace!("Status code: {}", status_code);
 
         // if it is a redirect, change location to host. If it is not a .onion return warning to user
         if status_code / 100 == 3 {
+            log::trace!("Got a redirect");
             if let Some(location) = response_headers.get("Location") {
                 let location = location.to_str()?;
                 let is_onion = location
@@ -247,10 +268,12 @@ async fn handler(
                     .ends_with(".onion");
 
                 if is_onion {
+                    log::trace!("Redirecting to tored onion");
                     let new_location = location.replace(".onion", &format!(".{}", public_host));
                     response_headers
                         .insert("Location", HeaderValue::from_str(&new_location).unwrap());
                 } else {
+                    log::trace!("Trying to redirect to non-onion");
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
                         location.len(),
@@ -258,12 +281,12 @@ async fn handler(
                     );
                     stream.write_all(response.as_bytes()).await?;
                     stream.flush().await?;
-                    return Ok(());
+                    break;
                 }
             }
         }
 
-        // rewrite all Domain=onion to Domain=host
+        // rewrite all cookies
         for cookie in cookies.clone().iter() {
             if let Some(domain) = cookie.domain() {
                 if domain.ends_with(".onion") {
@@ -276,10 +299,12 @@ async fn handler(
                 }
             }
         }
+        log::trace!("Rewrote cookies");
 
         // re-create header
         let mut header_bytes = headers_to_bytes(&mut response_headers.clone());
         header_bytes.append(&mut cookies_to_bytes(&cookies).await);
+        log::trace!("Recreated headers");
 
         // write response
         stream.write_all(&status_line.as_bytes()).await?;
@@ -287,10 +312,12 @@ async fn handler(
         stream.write_all(&header_bytes).await?;
         stream.write_all(b"\r\n").await?;
         stream.flush().await?;
+        log::trace!("Sent response");
 
         // write body
         forward_body(&mut tor_stream, stream, &response_headers).await?;
         stream.flush().await?;
+        log::trace!("Sent body");
 
         // keep alive
         let request_keep_alive = request_headers
@@ -301,15 +328,20 @@ async fn handler(
             .is_some_and(|v| v.to_str().unwrap().to_lowercase() == "keep-alive");
 
         if !request_keep_alive || !response_keep_alive {
+            log::trace!("Closing connection");
             break;
         }
+
+        log::trace!("Keeping connection alive");
     }
 
+    log::debug!("Shutting down streams");
     stream.shutdown().await.ok();
     if kept_tor_stream.is_some() {
         kept_tor_stream.unwrap().shutdown().await.ok();
     }
 
+    log::debug!("Handler finished");
     Ok(())
 }
 
@@ -320,27 +352,46 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+
     let port = env::var("PORT").unwrap_or("3000".to_string());
     let host = env::var("HOST").unwrap_or("0.0.0.0".to_string());
     let public_host = env::var("VIRTUAL_HOST")
         .unwrap_or(env::var("PUBLIC_HOST").unwrap_or("localhost".to_string()));
-    println!("Public host: {}", public_host);
     let addr = format!("{}:{}", host, port);
+    log::info!("Public host: {}", public_host);
 
+    log::info!("Starting arti client");
     let config = TorClientConfig::default();
     let tor_client =
-        TorClient::isolated_client(&TorClient::create_bootstrapped(config).await.unwrap());
+        TorClient::create_bootstrapped(config).await.unwrap_or_else(|_| {
+            panic!("Failed to create tor client");
+        });
     let state = AppState { tor_client };
+    log::info!("Arti client started");
 
-    let listerner = TcpListener::bind(&addr).await.unwrap();
-    println!("Listening at {}", addr);
+    let listerner = TcpListener::bind(&addr).await.unwrap_or_else(|_| {
+        panic!("Failed to bind to address: {}", addr);
+    });
+    log::info!("Listening at {}", addr);
 
     loop {
-        let (mut stream, _) = listerner.accept().await.unwrap();
-        let state = state.clone();
-        let public_host = public_host.clone();
+        let accept = listerner.accept().await;
+        if accept.is_err() {
+            log::warn!("Failed to accept connection");
+            continue;
+        }
+        let (mut stream, _) = accept.unwrap();
+        log::debug!("Accepted connection");
+
+        let (state, public_host) = (state.clone(), public_host.clone());
+        log::trace!("Spawning handler");
         tokio::spawn(async move {
-            handler(state, &mut stream, &public_host).await.ok();
+            let response = handler(state, &mut stream, &public_host).await;
+            if response.is_err() {
+                log::warn!("Failed to handle request: {:?}", response.err());
+            }
         });
+        log::trace!("Handler spawned");
     }
 }
