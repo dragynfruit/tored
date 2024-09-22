@@ -352,7 +352,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let port = env::var("PORT").unwrap_or("3000".to_string());
     let host = env::var("HOST").unwrap_or("0.0.0.0".to_string());
